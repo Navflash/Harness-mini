@@ -1,0 +1,10 @@
+services:
+  harness:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./workspace:/app/workspace
+    env_file:
+      - .env
+    restart: unless-stopped
