@@ -42,7 +42,15 @@ An AI agent is stateless: you send a prompt, it replies, it forgets. A **harness
                                       └──────────────┘
 ```
 
-## Quick Start (Local)
+## Quick Start (Local with Ollama)
+
+**Prerequisites:** [Install Ollama](https://ollama.ai) and download a model:
+```bash
+ollama pull qwen2.5:7b    # or your preferred model
+ollama serve              # start Ollama server (runs on http://localhost:11434)
+```
+
+Then run the harness:
 
 ```bash
 # 1. Clone & enter the project
@@ -54,24 +62,40 @@ python3 -m venv .venv && source .venv/bin/activate
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Set your API key
-cp .env.example .env
-# Edit .env and paste your OPENAI_API_KEY
-
-# 5. Run
+# 4. Run (no API key needed for local Ollama!)
 python -m harness
 ```
 
-Open **http://localhost:8000** — you'll see a chat UI. Type a message and watch the response stream in.
+Open **http://localhost:8000** — you'll see a chat UI. Type a message and watch the response stream in. Free, local, no API costs.
+
+### Switching Models
+
+```bash
+# List available models
+ollama list
+
+# Use a different model (edit .env or set env var)
+export MODEL=mistral:latest
+python -m harness
+
+# Or in .env:
+MODEL=neural-chat:latest
+```
 
 ## Quick Start (Docker)
 
+With Ollama already running on your machine:
+
 ```bash
-cp .env.example .env   # fill in your API key
+# Create .env if needed (optional—defaults to local Ollama)
+cp .env.example .env
+
 docker compose up --build
 ```
 
-That's it. The workspace directory is mounted as a volume so your conversation history survives container restarts.
+Open **http://localhost:8000**. The workspace directory is mounted as a volume so conversation history survives container restarts.
+
+**Note:** The Docker container connects to Ollama on your host machine. On Linux, this usually works automatically. On macOS/Windows, you may need to set `OPENAI_BASE_URL` to point to your Docker host (e.g., `host.docker.internal:11434` on Windows/Mac).
 
 ## Project Structure
 
@@ -137,19 +161,42 @@ All settings come from environment variables (or `.env`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `OPENAI_API_KEY` | *(required)* | Your OpenAI API key |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Compatible with Ollama, Together, etc. |
-| `MODEL` | `gpt-4o-mini` | Model name to use |
-| `DAILY_BUDGET` | `1.00` | Max USD spend per day |
+| `OPENAI_API_KEY` | `ollama` | API key; use "ollama" for local (no key needed) |
+| `OPENAI_BASE_URL` | `http://localhost:11434/v1` | Endpoint URL (defaults to Ollama local) |
+| `MODEL` | `qwen2.5:7b` | Model name to run |
+| `MAX_HISTORY_TURNS` | `20` | Keep last N user+assistant turn pairs (prevents context overflow) |
+| `DAILY_BUDGET` | `1.00` | Max USD spend per day (bypassed for local Ollama) |
 | `WORKSPACE_DIR` | `./workspace` | Where conversation data lives |
+| `HOST` | `0.0.0.0` | Server host |
 | `PORT` | `8000` | Server port |
 
-### Using with Ollama (local, free)
+### Using OpenAI API (instead of local Ollama)
 
 ```bash
-OPENAI_API_KEY=ollama
-OPENAI_BASE_URL=http://localhost:11434/v1
-MODEL=llama3.2
+export OPENAI_API_KEY=sk-...your-key...
+export OPENAI_BASE_URL=https://api.openai.com/v1
+export MODEL=gpt-4o-mini
+python -m harness
+```
+
+### Using Other Local LLM Servers
+
+The harness works with any OpenAI-compatible endpoint:
+
+```bash
+# LM Studio (default port 1234)
+export OPENAI_BASE_URL=http://localhost:1234/v1
+export MODEL=your-model-name
+
+# llama.cpp (if server enabled)
+export OPENAI_BASE_URL=http://localhost:8000/v1
+
+# Together.ai
+export OPENAI_API_KEY=your-together-key
+export OPENAI_BASE_URL=https://api.together.xyz/v1
+export MODEL=meta-llama/Meta-Llama-3-70B-Instruct
+
+python -m harness
 ```
 
 ## Key Concepts Demonstrated
@@ -157,9 +204,11 @@ MODEL=llama3.2
 1. **Stateless agent, stateful harness** — the LLM has no memory; the harness persists everything.
 2. **File-based storage** — no database needed; JSON/JSONL files you can `cat` and `grep`.
 3. **Context injection** — global and channel memory are assembled into the system prompt automatically.
-4. **Streaming delivery** — SSE so the browser shows tokens as they arrive.
-5. **Cost as first-class concern** — every run is metered and gated against a daily budget.
-6. **Abstract delivery** — the runner yields events; the server decides how to deliver them.
+4. **Bounded context** — `MAX_HISTORY_TURNS` keeps the KV cache from growing unbounded (important for local models).
+5. **Streaming delivery** — SSE so the browser shows tokens as they arrive.
+6. **Cost as first-class concern** — every run is metered and gated against a daily budget (skipped for local Ollama).
+7. **Multi-backend support** — works with OpenAI, Ollama, LM Studio, Together.ai, or any OpenAI-compatible endpoint.
+8. **Abstract delivery** — the runner yields events; the server decides how to deliver them.
 
 ## License
 
