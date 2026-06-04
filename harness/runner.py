@@ -35,6 +35,7 @@ async def run_agent(
     channel_id: str,
     user_message: str,
     budget_remaining: float,
+    images: list[str] | None = None,
 ) -> AsyncGenerator[dict, None]:
     """
     Run the agent and yield events:
@@ -51,9 +52,22 @@ async def run_agent(
     system_prompt = _build_system_prompt(ws, channel_id)
     history = ws.load_history(channel_id)
 
+    # Keep only the most recent N turn-pairs so KV cache stays bounded.
+    max_msgs = config.MAX_HISTORY_TURNS * 2
+    if len(history) > max_msgs:
+        history = history[-max_msgs:]
+
     messages = [{"role": "system", "content": system_prompt}]
     messages.extend(history)
-    messages.append({"role": "user", "content": user_message})
+
+    if images:
+        user_content: list | str = [{"type": "text", "text": user_message}]
+        for img in images:
+            user_content.append({"type": "image_url", "image_url": {"url": img}})
+    else:
+        user_content = user_message
+
+    messages.append({"role": "user", "content": user_content})
 
     # --- 3. Persist the user message ---
     ws.append_message(channel_id, "user", user_message)
@@ -74,12 +88,12 @@ async def run_agent(
     completion_tokens = 0
 
     try:
-        stream = await client.chat.completions.create(
-            model=config.MODEL,
-            messages=messages,
-            stream=True,
-            stream_options={"include_usage": True},
-        )
+        create_kwargs: dict = dict(model=config.MODEL, messages=messages, stream=True)
+        # stream_options is an OpenAI extension; Ollama / local servers don't support it
+        if not config.IS_LOCAL:
+            create_kwargs["stream_options"] = {"include_usage": True}
+
+        stream = await client.chat.completions.create(**create_kwargs)
 
         async for chunk in stream:
             # Usage info arrives in the final chunk.
@@ -110,10 +124,7 @@ async def run_agent(
 
 
 def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
-    """
-    Very rough cost estimate.  Override with real pricing for your model.
-    Defaults assume gpt-4o-mini pricing (~$0.15 / 1M input, ~$0.60 / 1M output).
-    """
-    input_cost = (prompt_tokens / 1_000_000) * 0.15
-    output_cost = (completion_tokens / 1_000_000) * 0.60
-    return input_cost + output_cost
+    if config.IS_LOCAL:
+        return 0.0
+    # gpt-4o-mini pricing (~$0.15 / 1M input, ~$0.60 / 1M output)
+    return (prompt_tokens / 1_000_000) * 0.15 + (completion_tokens / 1_000_000) * 0.60

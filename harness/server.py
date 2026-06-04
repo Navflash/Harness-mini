@@ -7,12 +7,15 @@ Endpoints:
   GET  /channels/{id}     → get channel history
   POST /channels/{id}/branch → branch conversation at a turn
   GET  /health            → liveness check
+  GET  /ready             → model warmup status
   GET  /cost              → today's spend
   GET  /                  → serves a minimal chat UI
 """
 import asyncio
 import json
+from contextlib import asynccontextmanager
 
+import openai
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel
@@ -21,7 +24,33 @@ from . import config
 from .runner import run_agent
 from .workspace import Workspace
 
-app = FastAPI(title="Mini Agent Harness", version="0.1.0")
+# Tracks whether the model has been warmed up.
+_model_ready = False
+
+
+async def _warmup_model() -> None:
+    global _model_ready
+    print(f"[harness] Warming up model '{config.MODEL}'…", flush=True)
+    client = openai.AsyncOpenAI(api_key=config.OPENAI_API_KEY, base_url=config.OPENAI_BASE_URL)
+    try:
+        await client.chat.completions.create(
+            model=config.MODEL,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+        _model_ready = True
+        print(f"[harness] Model ready.", flush=True)
+    except Exception as exc:
+        print(f"[harness] Warmup failed (is Ollama running?): {exc}", flush=True)
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    asyncio.create_task(_warmup_model())
+    yield
+
+
+app = FastAPI(title="Mini Agent Harness", version="0.1.0", lifespan=lifespan)
 
 # Initialise workspace once at startup.
 ws = Workspace(config.WORKSPACE_DIR)
@@ -43,6 +72,7 @@ def _lock_for(channel_id: str) -> asyncio.Lock:
 class ChatRequest(BaseModel):
     channel: str = "default"
     message: str
+    images: list[str] = []  # base64 data URLs, e.g. "data:image/png;base64,..."
 
 
 class BranchRequest(BaseModel):
@@ -56,6 +86,11 @@ class BranchRequest(BaseModel):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/ready")
+async def ready():
+    return {"ready": _model_ready, "model": config.MODEL}
 
 
 @app.get("/cost")
@@ -90,7 +125,7 @@ async def chat(req: ChatRequest):
         lock = _lock_for(req.channel)
         async with lock:
             budget_remaining = config.DAILY_BUDGET - ws.today_spend()
-            async for event in run_agent(ws, req.channel, req.message, budget_remaining):
+            async for event in run_agent(ws, req.channel, req.message, budget_remaining, req.images or None):
                 yield f"data: {json.dumps(event)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
@@ -127,6 +162,15 @@ CHAT_HTML = """<!DOCTYPE html>
   button { padding: 10px 20px; border-radius: 8px; border: none; background: #1b2a4a; color: #fff; font-size: 1rem; cursor: pointer; }
   button:hover { background: #2c3e6b; }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #warmupBanner { display: none; padding: 8px 20px; background: #2c3e6b; color: #a8c0e8; font-size: 0.85rem; text-align: center; }
+  #warmupBanner.visible { display: block; }
+  #imagePreview { display: flex; gap: 8px; padding: 6px 20px; background: #fff; border-top: 1px solid #e8ecf2; flex-wrap: wrap; }
+  #imagePreview:empty { display: none; }
+  .preview-thumb { position: relative; display: inline-flex; }
+  .preview-thumb img { height: 56px; border-radius: 6px; border: 1px solid #d8dee8; object-fit: cover; }
+  .preview-thumb button { position: absolute; top: -6px; right: -6px; width: 18px; height: 18px; border-radius: 50%; border: none; background: #d63031; color: #fff; font-size: 0.7rem; cursor: pointer; line-height: 1; padding: 0; }
+  #attachLabel { display: flex; align-items: center; padding: 0 4px; font-size: 1.3rem; cursor: pointer; color: #6b7c93; flex-shrink: 0; }
+  #attachLabel:hover { color: #1b2a4a; }
 </style>
 </head>
 <body>
@@ -138,8 +182,11 @@ CHAT_HTML = """<!DOCTYPE html>
     <button id="newChannelBtn">+ New</button>
   </div>
 </header>
+<div id="warmupBanner">Loading model — first response may be slower…</div>
 <div id="messages"></div>
+<div id="imagePreview"></div>
 <form id="chatForm">
+  <label id="attachLabel" title="Attach image">📎<input id="fileInput" type="file" accept="image/*" multiple style="display:none" /></label>
   <input id="input" placeholder="Type a message…" autocomplete="off" required />
   <button id="sendBtn" type="submit">Send</button>
 </form>
@@ -147,6 +194,41 @@ CHAT_HTML = """<!DOCTYPE html>
 const msgs = document.getElementById('messages');
 const form = document.getElementById('chatForm');
 const input = document.getElementById('input');
+const warmupBanner = document.getElementById('warmupBanner');
+const fileInput = document.getElementById('fileInput');
+const imagePreview = document.getElementById('imagePreview');
+
+let pendingImages = [];
+
+function readAsDataURL(file) {
+  return new Promise(res => { const r = new FileReader(); r.onload = e => res(e.target.result); r.readAsDataURL(file); });
+}
+
+fileInput.addEventListener('change', async () => {
+  for (const file of Array.from(fileInput.files)) {
+    const url = await readAsDataURL(file);
+    pendingImages.push(url);
+    const wrap = document.createElement('div');
+    wrap.className = 'preview-thumb';
+    const img = document.createElement('img'); img.src = url;
+    const rm = document.createElement('button'); rm.textContent = '×';
+    rm.onclick = () => { pendingImages.splice(pendingImages.indexOf(url), 1); wrap.remove(); };
+    wrap.append(img, rm);
+    imagePreview.appendChild(wrap);
+  }
+  fileInput.value = '';
+});
+
+async function pollReady() {
+  try {
+    const res = await fetch('/ready');
+    const { ready } = await res.json();
+    if (ready) { warmupBanner.classList.remove('visible'); return; }
+    warmupBanner.classList.add('visible');
+    setTimeout(pollReady, 1500);
+  } catch { setTimeout(pollReady, 2000); }
+}
+pollReady();
 const btn = document.getElementById('sendBtn');
 const channelSelect = document.getElementById('channelSelect');
 const newChannelBtn = document.getElementById('newChannelBtn');
@@ -192,7 +274,7 @@ newChannelBtn.addEventListener('click', () => {
   opt.textContent = name;
   channelSelect.appendChild(opt);
   channelSelect.value = name;
-  msgs.innerHTML = '';
+  loadHistory(name);
 });
 
 // Load on startup
@@ -215,13 +297,14 @@ form.addEventListener('submit', async (e) => {
   btn.disabled = true;
 
   addBubble('user', text);
+  pendingImages = []; imagePreview.innerHTML = '';
   const bubble = addBubble('assistant', '');
 
   try {
     const res = await fetch('/chat', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ message: text, channel: currentChannel }),
+      body: JSON.stringify({ message: text, channel: currentChannel, images: pendingImages }),
     });
 
     const reader = res.body.getReader();
